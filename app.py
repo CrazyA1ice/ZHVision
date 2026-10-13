@@ -131,6 +131,9 @@ def paginate(rows, prefix, default_size=15):
 
 def show_overview(rows, meta):
     st.subheader("数据概览")
+    if not rows:
+        st.info("当前筛选条件下没有匹配的回答，请在侧栏调整分类或日期范围。")
+        return
     df = records_dataframe(rows)
     cols = st.columns(5)
     cols[0].metric("回答数", f"{len(rows):,}")
