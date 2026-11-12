@@ -24,3 +24,6 @@ Scraper-Content/**/questions.md
 Scraper-Content/**/zvideos.md
 Scraper-Content/**/*_state.json
 Scraper-Content/**/images/
+
+# Per-record crash-recovery journal (may contain author text and embedded images)
+Scraper-Content/**/*_updates.jsonl
