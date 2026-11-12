@@ -117,6 +117,29 @@ def _read_json(path, default):
     return value
 
 
+def _append_journal(path, record):
+    """每条记录追加一次写前日志，避免每条都重写整个缓存。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _replay_journal(path, cache):
+    if not path.exists():
+        return
+    # 已写完整的一行就是一个可恢复检查点。遇损坏停止，避免覆盖资料。
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.endswith("\n"):
+                raise ValueError(f"未完成的归档日志行：{path}:{line_no}")
+            record = json.loads(line)
+            if not isinstance(record, dict) or not record.get("id"):
+                raise ValueError(f"归档日志结构异常：{path}:{line_no}")
+            cache[str(record["id"])] = record
+
+
 def _get_id(item):
     return str(item.get("id") or item.get("entity_id") or "").strip()
 
@@ -192,8 +215,17 @@ def _new_record(kind, item, detail, body_md, detail_complete, comments):
     updated = _updated(detail) or _updated(item)
     title = _display_title(kind, detail, ident)
     payload = detail if detail_complete else item
+    # 仅按正文/结构化媒体判断内容修改，不把赞同数日常波动当作改写。
+    content_fingerprint = {
+        "title": title, "body_md": body_md,
+        "content": payload.get("content"),
+        "content_html": payload.get("content_html"),
+        "detail": payload.get("detail"),
+        "attachment": payload.get("attachment"),
+        "video_info": payload.get("video_info"),
+    }
     fingerprint = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        json.dumps(content_fingerprint, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
     return {
         "id": ident,
@@ -381,7 +413,9 @@ async def sync_user_works(
     cache_file = base_dir / f"{kind}_cache.json"
     md_file = base_dir / f"{kind}.md"
     state_file = base_dir / f"{kind}_state.json"
+    journal_file = base_dir / f"{kind}_updates.jsonl"
     cache = _read_json(cache_file, {})
+    _replay_journal(journal_file, cache)
     previous_count = len(cache)
     entries, reached_end, stopped = await fetch_user_works_list(
         page, token, kind, mode, set(cache), fetch_json, log_fn, stop_event
@@ -447,8 +481,8 @@ async def sync_user_works(
             new_count += 1
         elif old.get("body_sha256") != record["body_sha256"] or old.get("detail_complete") != record["detail_complete"]:
             changed_count += 1
+        _append_journal(journal_file, record)
         cache[ident] = record
-        _atomic_json(cache_file, cache)
         if not record["detail_complete"]:
             partial_count += 1
         await asyncio.sleep(REQUEST_DELAY)
@@ -466,8 +500,11 @@ async def sync_user_works(
         "not_seen_in_full_scan": missing if mode == "full" else [],
         "failures": failures, "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
+    _atomic_json(cache_file, cache)
     _atomic_json(state_file, report)
     _atomic_write(md_file, render_markdown(kind, token, user_name or token, cache))
+    if journal_file.exists():
+        journal_file.unlink()
     log_fn(f"  {WORK_TYPES[kind][0]}归档完成: +{new_count}, 修改{changed_count}, 失败{failed_count}, 总数{len(cache)}")
     return {
         "token": token, "name": user_name or token, "folder": base_dir.name,
