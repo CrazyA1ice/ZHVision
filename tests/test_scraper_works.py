@@ -129,6 +129,24 @@ class WorkArchiveTests(unittest.TestCase):
             self.assertIn("介绍", md)
             self.assertFalse(list(Path(tmp).glob("*.mp4")))
 
+    def test_journal_replay_after_interrupted_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(run_work(tmp, "pins", FakeFetcher("pins", [pin("1", "已归档", 1700000000)])))
+            recovered = {
+                "id": "2", "content_type": "pins", "title": "恢复条目",
+                "url": "https://www.zhihu.com/pin/2", "created_ts": 1700000100,
+                "created_time": "2023-11-14 22:15", "updated_time": "",
+                "body_md": "中断前已保存的正文", "detail_complete": True,
+                "voteup": 0, "comment_count": 0, "author_comments": [],
+                "body_sha256": "saved"
+            }
+            journal = Path(tmp) / "pins_updates.jsonl"
+            journal.write_text(json.dumps(recovered, ensure_ascii=False) + "\n", encoding="utf-8")
+            result = asyncio.run(run_work(tmp, "pins", FakeFetcher("pins", []), mode="full"))
+            self.assertEqual(result["total_count"], 2)
+            self.assertIn("中断前已保存的正文", (Path(tmp) / "pins.md").read_text(encoding="utf-8"))
+            self.assertFalse(journal.exists())
+
     def test_invalid_cache_must_not_be_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pins_cache.json"
