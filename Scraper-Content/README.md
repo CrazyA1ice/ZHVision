@@ -38,7 +38,7 @@ Windows 可双击 run_zhihu_scraper.bat；图形界面新增五种内容多选�
 - articles.md、articles_cache.json、articles_state.json：文章
 - questions.md、questions_cache.json、questions_state.json：提问
 - zvideos.md、zvideos_cache.json、zvideos_state.json：视频元数据
-- images/pins、images/articles 等：选择本地图片模式时使用
+- images/：选择本地图片模式时使用（沿用原版相对路径规则）
 
 每个 JSON 缓存以原始作品 ID 为键，保留原始列表记录、成功取得的详情、
 内容哈希、正文 Markdown、时间和互动计数。MD 按发布时间倒序从缓存重建；
