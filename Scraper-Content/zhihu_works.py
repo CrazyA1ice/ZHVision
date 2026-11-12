@@ -130,7 +130,8 @@ def _updated(item):
 
 
 def _like_count(item):
-    statistics = (item.get("reaction") or {}).get("statistics") or {}
+    reaction = item.get("reaction")
+    statistics = (reaction.get("statistics") or {}) if isinstance(reaction, dict) else {}
     return _ts(item.get("voteup_count") or item.get("like_count") or statistics.get("like_count"))
 
 
@@ -224,7 +225,7 @@ def _as_markdown(record):
         "- 最后修改: " + record.get("updated_time", ""),
         "- 赞同数: " + str(record.get("voteup", 0)),
         "- 评论数: " + str(record.get("comment_count", 0)),
-        "- 详情状态: " + ("完整" if record.get("detail_complete") else "仅列表信息，待补全"),
+        "- 详情状态: " + ("仅视频元数据（未下载视频文件）" if record["content_type"] == "zvideos" else ("完整" if record.get("detail_complete") else "仅列表信息，待补全")),
         "",
         record.get("body_md", ""),
         "",
@@ -429,7 +430,7 @@ async def sync_user_works(
         try:
             body_md = await convert_html(
                 html_body=html_body, img_sem=img_sem, log_fn=log_fn,
-                embed_base64=embed_base64, images_dir=base_dir / "images" / kind,
+                embed_base64=embed_base64, images_dir=base_dir / "images",
                 progress_prefix=f"  [{kind} {idx}/{len(entries)}] ",
             )
         except Exception as exc:
