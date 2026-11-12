@@ -1,0 +1,5 @@
+# 知乎用户回答一键更新列表
+# 每行填写一个知乎用户主页链接或 url_token，括号内为用户ID（昵称），以 # 开头的行为注释
+
+https://www.zhihu.com/people/mdk82(无二小二)
+https://www.zhihu.com/people/tsk-47-98(凯翔)

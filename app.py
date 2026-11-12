@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import date, datetime, timedelta
 from hashlib import sha256
-from datetime import date
 from io import BytesIO
 import json
 import os
@@ -18,17 +18,28 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from core import (
-    apply_overrides, filter_records, lens_evidence, load_overrides, load_records,
-    records_dataframe, repeated_texts, save_override, semantic_neighbors, word_frequency,
+    apply_overrides,
     extractive_topic_summary,
+    filter_records,
+    lens_evidence,
+    load_overrides,
+    load_records,
+    records_dataframe,
+    repeated_texts,
+    save_override,
+    semantic_neighbors,
+    word_frequency,
 )
-from taxonomy import TAXONOMY, STOCK_LENSES
+from taxonomy import STOCK_LENSES, TAXONOMY
 
 ROOT = Path(__file__).resolve().parent
 WORKSPACE = ROOT / "workspace"
 UPLOAD_DIR = WORKSPACE / "uploads"
 OVERRIDE_DIR = WORKSPACE / "overrides"
+SETTINGS_FILE = WORKSPACE / "settings.json"
 ALL_CATEGORIES = list(TAXONOMY) + ["待分类"]
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500MB，兼容含 Base64 内嵌图片的 answers.md
+
 STOCK_IDEAS = {
     "普通人参与市场的风险": "反复质疑普通投资者能否在市场中稳定获利，提醒关注亏损风险与个人能力边界。",
     "成交量与牛熊判断": "经常将总成交量作为判断行情的重要观察量，对单纯观察指数或图形持怀疑态度。",
@@ -39,8 +50,16 @@ STOCK_IDEAS = {
     "价值投资与长期持有": "对价值投资的表述不完全一致：既有对长期持有和投资逻辑的质疑，也提到过普通人定期购买银行股的思路。应并列阅读语境。",
 }
 
-st.set_page_config(page_title="知乎内容研究台", page_icon="📚", layout="wide", initial_sidebar_state="expanded")
-st.markdown("""
+_BASE64_URI_RE = re.compile(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+")
+
+st.set_page_config(
+    page_title="知乎内容研究台",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+st.markdown(
+    """
 <style>
   .block-container {padding-top:1.7rem; max-width:1500px}
   h1,h2,h3 {letter-spacing:-0.02em}
@@ -48,72 +67,204 @@ st.markdown("""
   div[data-testid='stSidebar'] {border-right:1px solid rgba(120,120,120,.15)}
   a {text-decoration:none}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ==================== 用户默认路径配置持久化 ====================
+
+
+def load_user_settings() -> dict:
+    """加载持久化的用户配置（如默认解析 .md 所在的文件夹路径、最近选中的文件等）。"""
+    defaults = {
+        "default_md_dir": str(ROOT),
+        "last_selected_file": "",
+        "pinned_files": [],
+    }
+    if SETTINGS_FILE.is_file():
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                defaults.update(data)
+        except Exception:
+            pass
+    return defaults
+
+
+def save_user_settings(settings: dict) -> None:
+    """保存用户配置到 workspace/settings.json。"""
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def pick_folder_via_system_dialog(initial_dir: str) -> str:
+    """在本机运行时调用系统原生文件夹选择窗口，返回选中的目录路径。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        start_dir = initial_dir if initial_dir and Path(initial_dir).is_dir() else str(ROOT)
+        chosen = filedialog.askdirectory(initialdir=start_dir, title="选择存放知乎 .md 文件的默认目录")
+        root.destroy()
+        return str(Path(chosen).resolve()) if chosen else ""
+    except Exception as exc:
+        st.warning(f"无法打开系统文件夹对话框（{exc}），请直接在输入框中粘贴路径。")
+        return ""
+
+
+def pick_md_file_via_system_dialog(initial_dir: str) -> str:
+    """在本机运行时调用系统原生文件选择窗口（默认定位在用户设置的默认路径），返回选中的 .md/.json 路径。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        start_dir = initial_dir if initial_dir and Path(initial_dir).is_dir() else str(ROOT)
+        chosen = filedialog.askopenfilename(
+            initialdir=start_dir,
+            title="选择要解析的知乎回答文件 (.md / .json)",
+            filetypes=[
+                ("知乎导出文件 (*.md; *.json)", "*.md *.json"),
+                ("Markdown 文件 (*.md)", "*.md"),
+                ("JSON 缓存文件 (*.json)", "*.json"),
+                ("所有文件 (*.*)", "*.*"),
+            ],
+        )
+        root.destroy()
+        return str(Path(chosen).resolve()) if chosen else ""
+    except Exception as exc:
+        st.warning(f"无法打开系统文件选择对话框（{exc}），请使用下方列表或拖拽上传。")
+        return ""
+
+
+# ==================== 缓存与数据加载 ====================
+
+
+@st.cache_data(show_spinner="正在计算文件指纹...")
+def cached_file_digest(file_path: str, mtime_ns: int, file_size: int) -> str:
+    """缓存文件的 SHA-256 计算结果，避免含 Base64 图片的大文件在每次页面点击时重复读取。"""
+    h = sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(4 * 1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 @st.cache_data(show_spinner="解析数据并进行主题标注...")
-def cached_load(file: str, mtime: int):
+def cached_load(file: str, mtime_ns: int, file_size: int, content_hash_prefix: str):
+    """
+    结合文件路径、修改时间、文件大小与内容哈希前缀作为缓存键，
+    确保增量更新或覆盖同名文件后立即重新解析最新全部回答，绝不命中过期旧缓存。
+    """
     return load_records(file)
 
 
 @st.cache_data(show_spinner="正在进行中文分词...")
 def cached_wordfreq(text_ids_and_values, include_titles, stopwords, min_len):
-    from core import word_frequency
-    raw = [{"title": x[1], "body": x[2]} for x in text_ids_and_values]
+    raw = [
+        {"title": x[1], "body": _BASE64_URI_RE.sub("", x[2] or "")}
+        for x in text_ids_and_values
+    ]
     return word_frequency(raw, include_titles, stopwords, min_len)
 
 
+def resolve_override_path(src: Path, data_hash: str) -> Path:
+    """
+    获取人工标注文件路径。
+    为了避免同一个用户的 answers.md 在增量更新后因内容 hash 变化而丢失之前的标注，
+    优先使用基于源文件路径的稳定标注文件，并自动合并旧版基于文件 hash 的标注记录。
+    """
+    OVERRIDE_DIR.mkdir(parents=True, exist_ok=True)
+    legacy_hash_path = OVERRIDE_DIR / f"{data_hash[:24]}.json"
+    path_key = sha256(str(src.resolve()).lower().encode("utf-8")).hexdigest()[:20]
+    stable_path = OVERRIDE_DIR / f"src_{path_key}.json"
+
+    if legacy_hash_path.is_file() and not stable_path.is_file():
+        try:
+            stable_path.write_bytes(legacy_hash_path.read_bytes())
+        except Exception:
+            return legacy_hash_path
+    return stable_path
+
+
 def download_table(rows, filename="answers_clean.csv"):
-    # 面向 Excel 的文本导出：避免公式注入，避免中文乱码
     df = records_dataframe(rows)
     if df.empty:
         st.warning("当前筛选结果为空。")
         return
-    df["tags"] = df["tags"].map(lambda x: "; ".join(x))
+    df["tags"] = df["tags"].map(lambda x: "; ".join(x) if isinstance(x, list) else str(x))
     df["comments"] = df["comments"].map(lambda x: json.dumps(x, ensure_ascii=False))
     for c in df.select_dtypes(include="object").columns:
         df[c] = df[c].map(lambda v: "'" + v if isinstance(v, str) and re.match(r"^[=+\-@]", v) else v)
-    st.download_button("⬇ 下载清洗后的 CSV", df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=filename, mime="text/csv", use_container_width=True)
+    st.download_button(
+        "⬇ 下载清洗后的 CSV",
+        df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=filename,
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 def export_json(rows, filename="answers_classified.json"):
     payload = json.dumps(rows, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-    st.download_button("⬇ 下载结构化 JSON", payload, file_name=filename,
-                       mime="application/json", use_container_width=True)
+    st.download_button(
+        "⬇ 下载结构化 JSON",
+        payload,
+        file_name=filename,
+        mime="application/json",
+        use_container_width=True,
+    )
 
 
 def chart(fig):
-    fig.update_layout(template="plotly_white", margin=dict(t=30, l=15, b=25, r=15),
-                      font=dict(family="Microsoft YaHei, Noto Sans CJK SC, sans-serif"),
-                      height=380)
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(t=30, l=15, b=25, r=15),
+        font=dict(family="Microsoft YaHei, Noto Sans CJK SC, sans-serif"),
+        height=380,
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
-def record_card(r, *, key_prefix="record", expanded=False, show_excerpt=True):
-    ident = f"{key_prefix}_{r['id']}"
-    label = f"{r['title']}  ·  {r['date'][:10]}"
+def record_card(r, *, src_dir: Path = ROOT, key_prefix="record", expanded=False, show_excerpt=True):
+    date_label = (r.get("date") or "")[:10] or "未知日期"
+    label = f"{r['title']}  ·  {date_label}"
     with st.expander(label, expanded=expanded):
-        st.caption(f"{r['category']} / {r['subcategory']}  ·  {r['length']} 字 · ID: {r['id']} · 分类来源: {r.get('classification_method', '未知')}")
+        st.caption(
+            f"{r['category']} / {r['subcategory']}  ·  {r['length']} 字 · ID: {r['id']} · 分类来源: {r.get('classification_method', '未知')}"
+        )
         if r.get("quote") and show_excerpt:
             st.info("匹配段落：" + r["quote"])
-        st.markdown(r["body_md"] if r["body_md"] else "（正文为空）")
-        # 若原脚本生成的 images/ 目录已放在程序目录，显示对应的本地图片。
-        image_refs = re.findall(r"!\[[^\]]*\]\((images/[^)]+)\)", r["body_md"])
+        body_md = r.get("body_md") or ""
+        st.markdown(body_md if body_md else "（正文为空）")
+
+        image_refs = re.findall(r"!\[[^\]]*\]\((images/[^)]+)\)", body_md)
         for img_ref in image_refs[:15]:
-            img_path = (ROOT / img_ref).resolve()
-            if img_path.is_file() and img_path.is_relative_to(ROOT.resolve()):
-                st.image(str(img_path), caption=Path(img_ref).name)
+            for base_candidate in (src_dir.resolve(), ROOT.resolve()):
+                img_path = (base_candidate / img_ref).resolve()
+                if img_path.is_file() and img_path.is_relative_to(base_candidate):
+                    st.image(str(img_path), caption=Path(img_ref).name)
+                    break
+
         if r.get("comments"):
             st.markdown("**作者在评论区的留言与回复**")
             for c in r["comments"]:
                 if c.get("root_content"):
                     st.caption("前文：" + c["root_content"])
                 st.write(c.get("text", ""))
-        st.caption("标签：" + " · ".join(r["tags"]))
+        st.caption("标签：" + " · ".join(r.get("tags", [])))
         if r.get("note"):
             st.caption("我的笔记：" + r["note"])
-        if r["url"].startswith("https://www.zhihu.com/"):
+        if str(r.get("url", "")).startswith("https://www.zhihu.com/"):
             st.link_button("查看知乎原文 ↗", r["url"])
 
 
@@ -123,10 +274,15 @@ def paginate(rows, prefix, default_size=15):
     default = sizes.index(default_size) if default_size in sizes else 1
     size = a.selectbox("每页显示", sizes, index=default, key=f"{prefix}_size")
     max_page = max(1, (len(rows) + size - 1) // size)
-    page = b.number_input("页码", min_value=1, max_value=max_page, step=1, key=f"{prefix}_page")
+    page_key = f"{prefix}_page"
+    if st.session_state.get(page_key, 1) > max_page:
+        st.session_state[page_key] = max_page
+    if st.session_state.get(page_key, 1) < 1:
+        st.session_state[page_key] = 1
+    page = b.number_input("页码", min_value=1, max_value=max_page, step=1, key=page_key)
     begin = (page - 1) * size
-    st.caption(f"显示第 {begin+1 if rows else 0}—{min(begin + size, len(rows))} 条，共 {len(rows)} 条，{max_page} 页")
-    return rows[begin:begin + size]
+    st.caption(f"显示第 {begin + 1 if rows else 0}—{min(begin + size, len(rows))} 条，共 {len(rows)} 条，{max_page} 页")
+    return rows[begin : begin + size]
 
 
 def show_overview(rows, meta):
@@ -140,34 +296,52 @@ def show_overview(rows, meta):
     cols[1].metric("分类大类", f"{df['category'].nunique()}")
     cols[2].metric("正文总字数", f"{df['length'].sum():,}")
     cols[3].metric("正文中位数", f"{df['length'].median():,.0f} 字")
-    cols[4].metric("待人工复核标签", f"{(df['classification_method']=='模型建议·需复核').sum():,}")
-    if meta["zero_vote_records"] == meta["parsed"]:
+    cols[4].metric("待人工复核标签", f"{(df['classification_method'] == '模型建议·需复核').sum():,}")
+    if meta.get("zero_vote_records") == meta.get("parsed") and meta.get("parsed", 0) > 0:
         st.warning("源数据全部回答的赞同数为 0，无法据此评估真实热度。")
     left, right = st.columns([1, 1])
     with left:
         st.markdown("**各领域回答数（主类别）**")
         counts = df["category"].value_counts().reset_index()
         counts.columns = ["类别", "回答数"]
-        chart(px.bar(counts, x="回答数", y="类别", orientation="h", color="回答数",
-                     color_continuous_scale="Blues").update_yaxes(categoryorder="total ascending"))
+        chart(
+            px.bar(
+                counts,
+                x="回答数",
+                y="类别",
+                orientation="h",
+                color="回答数",
+                color_continuous_scale="Blues",
+            ).update_yaxes(categoryorder="total ascending")
+        )
     with right:
         st.markdown("**月度回答数量**")
-        monthly = df.groupby("month").size().reset_index(name="回答数").sort_values("month")
-        chart(px.line(monthly, x="month", y="回答数", markers=True))
+        valid_month_df = df[df["month"].notna() & (df["month"] != "")]
+        if not valid_month_df.empty:
+            monthly = valid_month_df.groupby("month").size().reset_index(name="回答数").sort_values("month")
+            chart(px.line(monthly, x="month", y="回答数", markers=True))
+        else:
+            st.info("暂无可解析的月份数据。")
     a, b = st.columns(2)
     with a:
         st.markdown("**篇幅分布**")
         chart(px.histogram(df, x="length", nbins=55, labels={"length": "正文字符数"}))
     with b:
         st.markdown("**星期分布**")
-        weekday = df["weekday"].value_counts().reindex(range(7), fill_value=0).reset_index()
+        weekday = df["weekday"].dropna().value_counts().reindex(range(7), fill_value=0).reset_index()
         weekday.columns = ["星期", "回答数"]
         weekday["星期"] = weekday["星期"].map(dict(enumerate(list("一二三四五六日"))))
         chart(px.bar(weekday, x="星期", y="回答数", text="回答数"))
     st.markdown("**数据质量检查**")
-    st.write(f"原始条目 {meta['parsed']}；去重后 {meta['deduplicated']}；重复 ID {meta['duplicate_ids']}；空正文 {meta['empty_bodies']}；作者留言 {meta['comments']}；模型建议待核实 {meta.get('machine_suggested',0)}。")
+    st.write(
+        f"原始条目 {meta['parsed']}；去重后 {meta['deduplicated']}；重复 ID {meta['duplicate_ids']}；"
+        f"空正文 {meta['empty_bodies']}；作者留言 {meta['comments']}；模型建议待核实 {meta.get('machine_suggested', 0)}。"
+    )
     with st.expander("查看分类规则与质量说明"):
-        st.write("采用规则关键词 + 从规则标注结果训练的字符 TF-IDF 模型辅助分类。模型建议仅作为检索分组，未经过人工标注的准确率验证，尤其可能误判讽刺、隐喻与短句；请在标注页修订。")
+        st.write(
+            "采用规则关键词 + 从规则标注结果训练的字符 TF-IDF 模型辅助分类。"
+            "模型建议仅作为检索分组，未经过人工标注的准确率验证，尤其可能误判讽刺、隐喻与短句；请在标注页修订。"
+        )
     if meta.get("declared") is not None and meta["declared"] != meta["parsed"]:
         st.error(f"源文件声明 {meta['declared']} 条，但仅解析到 {meta['parsed']} 条，请检查文件是否完整。")
     repeats = repeated_texts(rows)
@@ -178,16 +352,16 @@ def show_overview(rows, meta):
                 st.markdown(" / ".join(f"[{x['title']}]({x['url']})" for x in group))
 
 
-def show_library(rows):
+def show_library(rows, src_dir: Path = ROOT):
     st.subheader("回答资料库")
     st.caption("搜索支持多个空格分隔词，默认所有词同时命中；分类筛选在左侧。点击标题可查看回答全文和原文链接。")
-    a,b,c = st.columns([2,1,1])
+    a, b, c = st.columns([2, 1, 1])
     query = a.text_input("全文关键词", placeholder="例如：成交量 情绪 / 庄子 / 牛市")
     location = b.selectbox("检索范围", ["全部", "问题标题", "回答正文"])
     order = c.selectbox("排序", ["时间（新到旧）", "时间（旧到新）", "篇幅（长到短）", "篇幅（短到长）"])
     only_favs = st.checkbox("只显示收藏")
     results = filter_records(rows, query=query, search_in=location, favorites=only_favs)
-    keyfunc = (lambda r: r["date"]) if order.startswith("时间") else (lambda r: r["length"])
+    keyfunc = (lambda r: r.get("date") or "") if order.startswith("时间") else (lambda r: r.get("length", 0))
     results.sort(key=keyfunc, reverse=order.endswith("新到旧）") or order.endswith("长到短）"))
     st.metric("匹配回答", len(results))
     aa, bb = st.columns(2)
@@ -197,22 +371,38 @@ def show_library(rows):
         export_json(results, "filtered_answers.json")
     if results:
         for row in paginate(results, "library"):
-            record_card(row, key_prefix="library")
+            record_card(row, src_dir=src_dir, key_prefix="library")
 
 
 def make_topic_markdown(category, rows, idea=None):
-    lines = [f"# {category}：回答证据目录", "", f"筛选条件：{idea or '所有相关回答'}", f"数量：{len(rows)}", "",
-             "> 自动筛选并非人工事实核验；观点不代表真实市场事实或投资建议。", ""]
+    lines = [
+        f"# {category}：回答证据目录",
+        "",
+        f"筛选条件：{idea or '所有相关回答'}",
+        f"数量：{len(rows)}",
+        "",
+        "> 自动筛选并非人工事实核验；观点不代表真实市场事实或投资建议。",
+        "",
+    ]
     for i, r in enumerate(rows, 1):
-        lines.extend([f"## {i}. {r['title']}", "", f"- 发布：{r['date']}",
-                      f"- 来源：{r['url']}", "", r["body_md"], ""])
+        lines.extend(
+            [
+                f"## {i}. {r['title']}",
+                "",
+                f"- 发布：{r['date']}",
+                f"- 来源：{r['url']}",
+                "",
+                r["body_md"],
+                "",
+            ]
+        )
     return "\n".join(lines).encode("utf-8")
 
 
-def show_topic(rows, original_rows):
+def show_topic(rows, original_rows, src_dir: Path = ROOT):
     st.subheader("专题研究 · 观点与证据")
     st.caption("观点总结为可解释的文本分析线索，不是对作者整体立场的最终判定。可展开每条原文，也可一次导出该专题所有回答。")
-    a,b = st.columns([2,1])
+    a, b = st.columns([2, 1])
     category = a.selectbox("研究领域", list(TAXONOMY))
     all_corpus = b.checkbox("使用完整数据集（忽略左侧筛选）", value=True)
     base = original_rows if all_corpus else rows
@@ -224,12 +414,14 @@ def show_topic(rows, original_rows):
     dd = records_dataframe(related)
     sub = dd["subcategory"].value_counts().reset_index()
     sub.columns = ["细分类", "数量"]
-    col1,col2 = st.columns([1,1])
+    col1, col2 = st.columns([1, 1])
     with col1:
         chart(px.bar(sub, x="数量", y="细分类", orientation="h").update_yaxes(categoryorder="total ascending"))
     with col2:
-        per_month = dd.groupby("month").size().reset_index(name="数量").sort_values("month")
-        chart(px.line(per_month, x="month", y="数量", markers=True))
+        valid_dd = dd[dd["month"].notna() & (dd["month"] != "")]
+        if not valid_dd.empty:
+            per_month = valid_dd.groupby("month").size().reset_index(name="数量").sort_values("month")
+            chart(px.line(per_month, x="month", y="数量", markers=True))
     st.markdown("#### 核心思想与原文证据")
     st.caption("使用当前数据集的原文句子生成抽取式摘要；仅展示作者确实写过的话，不自动推断其赞同或反对立场。摘要可按当前上传文件变化。")
     if category == "股票金融":
@@ -253,7 +445,7 @@ def show_topic(rows, original_rows):
             st.markdown(f"- 『{item['quote']}』 — [原回答：{item['title']}]({item['url']})")
         try:
             freq = cached_wordfreq(tuple((r["id"], r["title"], r["body"]) for r in related), True, (), 2)
-            st.markdown("**高频讨论词：** " + "、".join(f"{w}（{n}）" for w,n in freq.most_common(12)))
+            st.markdown("**高频讨论词：** " + "、".join(f"{w}（{n}）" for w, n in freq.most_common(12)))
         except ImportError:
             st.warning("需要安装 jieba 才能显示分词。")
         lens = st.text_input("按关键词深入某一观点（逗号或空格分隔，留空表示全部）", value="")
@@ -261,21 +453,27 @@ def show_topic(rows, original_rows):
         matched.sort(key=lambda r: r.get("match_score", 0), reverse=True)
     st.caption(f"关键词召回 {len(matched)} 条；命中一个词不等于作者认同相关观点，逐条点击核对。")
     st.markdown("#### 全部匹配回答（可逐条查看）")
-    a,b,c = st.columns(3)
+    a, b, c = st.columns(3)
     a.metric("找到", len(matched))
     with b:
-        st.download_button("⬇ 导出完整专题 Markdown", make_topic_markdown(category, matched, lens),
-                           file_name=f"专题_{category}.md", mime="text/markdown", use_container_width=True)
+        st.download_button(
+            "⬇ 导出完整专题 Markdown",
+            make_topic_markdown(category, matched, lens),
+            file_name=f"专题_{category}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
     with c:
         download_table(matched, f"topic_{category}.csv")
     for r in paginate(matched, "topic", 15):
-        record_card(r, key_prefix="topic")
+        record_card(r, src_dir=src_dir, key_prefix="topic")
 
 
 def find_chinese_font():
     opts = [
         os.getenv("ZH_FONT", ""),
-        r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\simsun.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
@@ -293,14 +491,14 @@ def show_words(rows):
     if not rows:
         st.warning("没有满足筛选条件的数据。")
         return
-    a,b,c = st.columns(3)
+    a, b, c = st.columns(3)
     include_titles = a.checkbox("统计时包含问题标题", value=False)
     min_len = b.slider("最短词长", min_value=2, max_value=5, value=2)
     topn = c.slider("展示词数", 20, 150, 60, 10)
     stop = st.text_area("额外停用词（逗号、空格或换行分隔）", value="", height=65)
     extra = tuple(sorted(set(x for x in re.split(r"[,，\s]+", stop.strip()) if x)))
     try:
-        freq = cached_wordfreq(tuple((r["id"],r["title"],r["body"]) for r in rows), include_titles, extra, min_len)
+        freq = cached_wordfreq(tuple((r["id"], r["title"], r["body"]) for r in rows), include_titles, extra, min_len)
     except ImportError:
         st.error("缺少 jieba，请执行 pip install -r requirements.txt")
         return
@@ -310,18 +508,26 @@ def show_words(rows):
         return
     tops = freq.most_common(topn)
     freq_df = pd.DataFrame(tops, columns=["词语", "出现次数"])
-    u,v = st.columns([1.1,0.9])
+    u, v = st.columns([1.1, 0.9])
     with u:
         st.markdown("**词云**")
         try:
             from wordcloud import WordCloud
+
             font = find_chinese_font()
             if not font:
                 st.warning("未发现中文字体；设置环境变量 ZH_FONT 为系统上的中文字体文件路径后即可生成词云。")
             else:
-                wc = WordCloud(font_path=font, width=1150, height=630, background_color="white",
-                               max_words=topn, colormap="viridis", random_state=42,
-                               collocations=False).generate_from_frequencies(dict(tops))
+                wc = WordCloud(
+                    font_path=font,
+                    width=1150,
+                    height=630,
+                    background_color="white",
+                    max_words=topn,
+                    colormap="viridis",
+                    random_state=42,
+                    collocations=False,
+                ).generate_from_frequencies(dict(tops))
                 image_bytes = BytesIO()
                 wc.to_image().save(image_bytes, format="PNG")
                 st.image(image_bytes.getvalue(), use_container_width=True)
@@ -332,105 +538,251 @@ def show_words(rows):
         st.markdown("**高频词 TOP 25**")
         chart(px.bar(freq_df.head(25).iloc[::-1], x="出现次数", y="词语", orientation="h"))
     st.dataframe(freq_df, use_container_width=True, hide_index=True)
-    st.download_button("⬇ 下载词频 CSV", freq_df.to_csv(index=False).encode("utf-8-sig"),
-                       "word_frequency.csv", "text/csv")
+    st.download_button(
+        "⬇ 下载词频 CSV",
+        freq_df.to_csv(index=False).encode("utf-8-sig"),
+        "word_frequency.csv",
+        "text/csv",
+    )
     st.caption("词频为分词后的出现次数，不代表作者对该词的正面评价；可加入停用词进一步改善。")
 
 
 def show_associations(rows):
     st.subheader("主题关联 · 时间演化 · 相似回答")
     if not rows:
+        st.info("当前筛选范围内没有回答数据。")
         return
     st.markdown("**主题随时间的变化（以主类别计）**")
     df = records_dataframe(rows)
-    bymonth = df.groupby(["month", "category"]).size().reset_index(name="回答数")
-    fig = px.area(bymonth.sort_values("month"), x="month", y="回答数", color="category",
-                  labels={"month":"月份"})
-    chart(fig)
+    valid_df = df[df["month"].notna() & (df["month"] != "")]
+    if not valid_df.empty:
+        bymonth = valid_df.groupby(["month", "category"]).size().reset_index(name="回答数")
+        fig = px.area(
+            bymonth.sort_values("month"),
+            x="month",
+            y="回答数",
+            color="category",
+            labels={"month": "月份"},
+        )
+        chart(fig)
+    else:
+        st.info("当前数据缺少可解析的月份信息，无法绘制月度演化趋势。")
+
     st.markdown("**比较关键词的发文趋势**")
     terms = st.text_input("比较词（逗号隔开）", value="成交量,牛市,股票,庄子")
     termlist = [x.strip() for x in re.split(r"[,，、]", terms) if x.strip()][:8]
-    if termlist:
+    if termlist and not valid_df.empty:
         records = []
-        for month, group in df.groupby("month"):
-            combined = (group["title"] + " " + group["body"]).tolist()
+        for month, group in valid_df.groupby("month"):
+            combined = (group["title"].fillna("") + " " + group["body"].fillna("")).tolist()
             for term in termlist:
-                records.append({"月份":month, "关键词":term, "匹配回答数":sum(term.lower() in t.lower() for t in combined)})
-        chart(px.line(pd.DataFrame(records).sort_values("月份"), x="月份", y="匹配回答数", color="关键词", markers=True))
+                records.append(
+                    {
+                        "月份": month,
+                        "关键词": term,
+                        "匹配回答数": sum(term.lower() in t.lower() for t in combined),
+                    }
+                )
+        if records:
+            chart(
+                px.line(
+                    pd.DataFrame(records).sort_values("月份"),
+                    x="月份",
+                    y="匹配回答数",
+                    color="关键词",
+                    markers=True,
+                )
+            )
     st.markdown("**相似回答发现（TF-IDF 字符 n-gram）**")
     opts = {f"{r['title'][:70]} · {r['id']}": r["id"] for r in rows}
     chosen = st.selectbox("选择要查找相似回答的文章", list(opts))
-    if st.button("查找相关内容", type="primary"):
+    if chosen and st.button("查找相关内容", type="primary"):
         with st.spinner("正在计算语义文本相似度（基于字词重叠，而非大型语言模型）..."):
             similar = semantic_neighbors(rows, opts[chosen], 12)
         if not similar:
             st.info("没有找到相似回答。")
-        for r,score in similar:
-            st.markdown(f"**相似度 {score:.3f}** · [{r['title']}]({r['url']}) · {r['date'][:10]}")
-            st.caption(r["body"][:240])
+        for r, score in similar:
+            st.markdown(f"**相似度 {score:.3f}** · [{r['title']}]({r['url']}) · {(r.get('date') or '')[:10]}")
+            st.caption((r.get("body") or "")[:240])
     st.caption("相似度用于帮助发现重复论点和跨领域联系，不应视为观点完全一致。")
 
 
 def show_labels(rows, filtered, override_path):
     st.subheader("人工分类、收藏与研究笔记")
-    st.caption("自动分类可能误判，尤其是短句、反讽、隐喻。模型辅助类别均为待核实建议。人工修改保存在 workspace/overrides.json；不改动原始 answers.md。")
-    a,b = st.columns(2)
+    st.caption("自动分类可能误判，尤其是短句、反讽、隐喻。模型辅助类别均为待核实建议。人工修改保存在 workspace/overrides/ 下；不改动原始 answers.md。")
+    pool = filtered or rows
+    if not pool:
+        st.info("当前没有可标注的回答。")
+        return
+
+    a, b = st.columns(2)
     with a:
-        pool = filtered or rows
         if st.checkbox("仅看模型建议（待人工复核）"):
             suggested = [r for r in pool if r.get("classification_method") == "模型建议·需复核"]
             if suggested:
                 pool = suggested
+            else:
+                st.info("当前筛选范围内没有『模型建议·需复核』的条目，已展示全部可选回答。")
         opts = {f"{x['title'][:72]}  [{x['id']}]": x["id"] for x in pool}
         option = st.selectbox("选择一篇回答", list(opts), key="annotation_select")
-        chosen = next(r for r in pool if r["id"] == opts[option])
+        chosen = next((r for r in pool if r["id"] == opts.get(option)), pool[0])
         st.markdown("**原文**")
-        st.markdown(chosen["body_md"])
+        st.markdown(chosen["body_md"] or "（正文为空）")
         st.markdown(f"[知乎原文]({chosen['url']})")
     with b:
         cats = ALL_CATEGORIES
-        category = st.selectbox("主类别", cats,
-                                index=cats.index(chosen["category"]) if chosen["category"] in cats else len(cats)-1,
-                                key=f"category_{chosen['id']}")
+        category = st.selectbox(
+            "主类别",
+            cats,
+            index=cats.index(chosen["category"]) if chosen["category"] in cats else len(cats) - 1,
+            key=f"category_{chosen['id']}",
+        )
         subs = ["待分类"] + list(TAXONOMY.get(category, {}))
         current_sub = chosen["subcategory"] if chosen["subcategory"] in subs else "待分类"
         sub = st.selectbox("细分类", subs, index=subs.index(current_sub), key=f"sub_{chosen['id']}")
-        tags = st.multiselect("多标签", cats, default=[k for k in chosen["tags"] if k in cats],
-                              key=f"tags_{chosen['id']}")
-        favorite = st.checkbox("标记为收藏", value=chosen.get("favorite",False), key=f"fav_{chosen['id']}")
-        note = st.text_area("研究笔记", value=chosen.get("note",""), height=130,
-                            key=f"note_{chosen['id']}")
+        tags = st.multiselect(
+            "多标签",
+            cats,
+            default=[k for k in chosen["tags"] if k in cats],
+            key=f"tags_{chosen['id']}",
+        )
+        favorite = st.checkbox("标记为收藏", value=chosen.get("favorite", False), key=f"fav_{chosen['id']}")
+        note = st.text_area("研究笔记", value=chosen.get("note", ""), height=130, key=f"note_{chosen['id']}")
         if st.button("💾 保存人工修订", type="primary"):
-            save_override(override_path, chosen["id"], {"category": category, "subcategory": sub,
-                                                       "tags": sorted(set(tags + [category])),
-                                                       "note": note, "favorite": favorite})
-            st.success("保存成功。分类与笔记会在重新运行程序后保留。")
+            save_override(
+                override_path,
+                chosen["id"],
+                {
+                    "category": category,
+                    "subcategory": sub,
+                    "tags": sorted(set(tags + [category])),
+                    "note": note,
+                    "favorite": favorite,
+                },
+            )
+            st.success("保存成功。分类与笔记会在重新运行程序及增量更新后保留。")
             st.rerun()
     st.divider()
     st.markdown("**批量导出当前筛选的内容**")
-    d1,d2 = st.columns(2)
+    d1, d2 = st.columns(2)
     with d1:
         download_table(filtered, "zhihu_curated.csv")
     with d2:
         export_json(filtered, "zhihu_curated.json")
     if override_path.exists():
         st.download_button("⬇ 备份人工标注文件", override_path.read_bytes(), "overrides.json", "application/json")
-    st.caption("各数据集的人工标注相互隔离。相同文件内容重新上传仍会沿用已有标注；源内容改变会使用新的标注文件。")
+    st.caption("各数据集的人工标注相互独立保存。")
 
 
-def available_sources():
-    """扫描随包示例文件及历史上传文件。全部上传均在本地保存，无远端 API。"""
-    candidates = [ROOT / "answers.md", ROOT / "answers_cache.json"]
+# ==================== 多来源文件扫描与默认路径发现 ====================
+
+_IGNORED_DIRS = {".venv", "venv", "node_modules", ".git", "__pycache__", ".pw_profile", "workspace", "images"}
+
+
+def scan_md_sources(default_md_dir: str, pinned_files: list[str] | None = None, just_uploaded: list[Path] | None = None) -> list[Path]:
+    """
+    扫描可用的 .md / .json 数据文件，按优先级汇总去重：
+    1. 本次刚通过上传控件上传的文件（just_uploaded）；
+    2. 用户通过「从默认路径打开 .md 文件」手动选中的文件（pinned_files，最新在最前）；
+    3. 用户设置的默认解析目录（default_md_dir）下的用户子目录（如 `zhihu_xxx(用户ID)/answers.md`）及直接文件（按修改时间从新到旧排序）；
+    4. workspace/uploads/ 下的历史上传文件（按修改时间从新到旧排序）；
+    5. 程序根目录 ROOT 下的示例/兜底文件（放在最后，避免遮蔽用户新上传或新更新的文件）。
+    """
+    found: list[Path] = []
+    seen_resolved: set[Path] = set()
+
+    def _add_file(p: Path):
+        try:
+            if p.is_file() and p.suffix.lower() in {".md", ".json"}:
+                if p.name.lower() in {"readme.md", "settings.json", "overrides.json", "package.json"}:
+                    return
+                rp = p.resolve()
+                if rp not in seen_resolved:
+                    seen_resolved.add(rp)
+                    found.append(rp)
+        except Exception:
+            pass
+
+    # 1. 刚上传的文件排在最前
+    for up in reversed(just_uploaded or []):
+        _add_file(Path(up))
+
+    # 2. 手动通过对话框选中的文件
+    for fp in reversed(pinned_files or []):
+        if fp:
+            _add_file(Path(fp))
+
+    # 3. 扫描用户设置的默认解析目录
+    if default_md_dir:
+        d_path = Path(default_md_dir)
+        if d_path.is_file():
+            _add_file(d_path)
+            d_path = d_path.parent
+        if d_path.is_dir():
+            try:
+                # 先收集该目录下所有候选文件（直接文件 + 一级子目录中的 answers.md），统一按最新修改时间排序
+                dir_candidates: list[Path] = []
+                for p in d_path.iterdir():
+                    if p.is_file() and p.suffix.lower() in {".md", ".json"}:
+                        # 如果 d_path 恰好是 ROOT，把 ROOT/answers.md 留到最后兜底，优先展示用户子目录文件
+                        if d_path.resolve() == ROOT and p.name in {"answers.md", "answers_cache.json"}:
+                            continue
+                        dir_candidates.append(p)
+                    elif p.is_dir() and p.name not in _IGNORED_DIRS and not p.name.startswith("."):
+                        ans_md = p / "answers.md"
+                        if ans_md.is_file():
+                            dir_candidates.append(ans_md)
+                        else:
+                            for sub_f in p.iterdir():
+                                if sub_f.is_file() and sub_f.suffix.lower() in {".md", ".json"}:
+                                    dir_candidates.append(sub_f)
+                dir_candidates.sort(key=lambda x: x.stat().st_mtime_ns if x.exists() else 0, reverse=True)
+                for c in dir_candidates:
+                    _add_file(c)
+            except Exception:
+                pass
+
+    # 4. 历史通过浏览器拖拽上传的文件（按最新上传/修改时间倒序）
     if UPLOAD_DIR.exists():
-        candidates += sorted((p for p in UPLOAD_DIR.iterdir() if p.suffix.lower() in {".md", ".json"}),
-                             key=lambda p: p.stat().st_mtime_ns, reverse=True)
-    return [p for p in candidates if p.is_file()]
+        for p in sorted(
+            (p for p in UPLOAD_DIR.iterdir() if p.is_file() and p.suffix.lower() in {".md", ".json"}),
+            key=lambda p: p.stat().st_mtime_ns,
+            reverse=True,
+        ):
+            _add_file(p)
+
+    # 5. 最后才添加程序根目录下的默认 answers.md / answers_cache.json 兜底
+    for fallback in (ROOT / "answers.md", ROOT / "answers_cache.json"):
+        _add_file(fallback)
+
+    return found
+
+
+def format_source_label(p: Path, default_md_dir: str = "") -> str:
+    """
+    为下拉框生成**全局唯一**且清晰易读的文件展示名。
+    注意：在 Streamlit 中，如果两个不同路径的文件返回相同的 format_func 文本（例如都叫 `answers.md`），
+    切换页面模块时 selectbox 会误匹配到列表中的第一个同名旧文件！
+    因此这里附加上父目录名、修改时间与短标识，保证每个选项文本唯一且直观。
+    """
+    try:
+        mtime_str = datetime.fromtimestamp(p.stat().st_mtime).strftime("%m-%d %H:%M")
+    except Exception:
+        mtime_str = ""
+
+    if p.parent == UPLOAD_DIR and "__" in p.name:
+        digest_prefix, orig_name = p.name.split("__", 1)
+        return f"[上传 {mtime_str} #{digest_prefix[:6]}] {orig_name}"
+
+    if p.parent == ROOT:
+        return f"[程序目录 {mtime_str}] {p.name}"
+
+    return f"{p.parent.name} / {p.name} ({mtime_str})"
 
 
 def safe_uploaded_filename(name):
-    # Streamlit UploadedFile.name 由客户端提供，只采用 basename 字符；避免路径穿越。
     cleaned = re.sub(r"[^0-9A-Za-z_.\-\u4e00-\u9fff]", "_", Path(str(name).replace("\\", "/")).name)
-    return (cleaned[:75] or "answers.md")
+    return cleaned[:75] or "answers.md"
 
 
 def import_uploads(uploaded):
@@ -440,29 +792,51 @@ def import_uploads(uploaded):
         if ext not in {".md", ".json"}:
             continue
         payload = item.getvalue()
-        if not payload or len(payload) > 40 * 1024 * 1024:
-            st.warning(f"跳过 {item.name}：文件为空或大于 40 MB")
+        if not payload or len(payload) > MAX_UPLOAD_BYTES:
+            st.warning(f"跳过 {item.name}：文件为空或大于 500 MB")
             continue
         digest = sha256(payload).hexdigest()[:16]
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         path = UPLOAD_DIR / f"{digest}__{safe_uploaded_filename(item.name)}"
-        if not path.exists():
-            path.write_bytes(payload)
-        accepted.append(path)
+        # 每次上传均写入并刷新 mtime，确保最新上传的文件排在最前并触发重新解析
+        path.write_bytes(payload)
+        accepted.append(path.resolve())
     return accepted
 
 
-def show_data_management(src, rows, meta, digest):
-    st.subheader("数据文件管理")
-    st.success(f"正在分析：{src.name} · {len(rows):,} 条回答")
-    st.write("你可以在左侧上传一份或多份由爬虫导出的 Markdown 文件，选择任意一个进行分析；全部图表、搜索、观点摘要和人工标注均依据当前选中文件计算。")
-    st.code(f"数据 SHA-256: {digest}\n本地原始文件: {src}", language="text")
-    st.json({"源格式": meta.get("format"), "文件声明条数": meta.get("declared"),
-             "实际解析条数": meta["parsed"], "去重后": meta["deduplicated"],
-             "重复ID": meta["duplicate_ids"], "空正文": meta["empty_bodies"],
-             "评论条数": meta["comments"], "分类待复核": meta["machine_suggested"]})
+def show_data_management(src: Path, rows, meta, digest, settings: dict):
+    st.subheader("数据文件与默认路径管理")
+    st.success(f"正在分析：{format_source_label(src, settings.get('default_md_dir', ''))} · {len(rows):,} 条回答")
+    st.write(
+        "你可以在左侧设置每次打开解析 `.md` 文件所在的**默认目录路径**（支持自动扫描该目录下所有 `zhihu_xxx(用户ID)/answers.md`），"
+        "或直接点击「📄 从默认路径打开 .md 文件」弹出文件选择框；也可以拖拽上传文件。"
+    )
+    st.code(
+        f"当前默认解析路径: {settings.get('default_md_dir', str(ROOT))}\n"
+        f"当前加载原始文件: {src}\n"
+        f"文件最后修改时间: {datetime.fromtimestamp(src.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"数据 SHA-256: {digest}",
+        language="text",
+    )
+    st.json(
+        {
+            "源格式": meta.get("format"),
+            "文件声明条数": meta.get("declared"),
+            "实际解析条数": meta["parsed"],
+            "去重后": meta["deduplicated"],
+            "重复ID": meta["duplicate_ids"],
+            "空正文": meta["empty_bodies"],
+            "评论条数": meta["comments"],
+            "分类待复核": meta["machine_suggested"],
+        }
+    )
+    if meta.get("declared") is not None and meta["declared"] != meta["parsed"]:
+        st.warning(
+            f"注意：该文件头部声明回答总数为 {meta['declared']} 条，但文件中实际包含 `## ` 回答条目为 {meta['parsed']} 条。"
+        )
     st.markdown("**格式示例：**")
-    st.code("""# 知乎用户「某某」的全部回答
+    st.code(
+        """# 知乎用户「某某」的全部回答
 - 回答总数: 1
 
 ## 股票市场该怎么看？
@@ -470,66 +844,232 @@ def show_data_management(src, rows, meta, digest):
 - 发布时间: 2026-10-13 12:00
 - 赞同数: 4
 
-这里是回答正文，也可以包含多段文字、列表、图片 Markdown 链接。""", language="markdown")
-    st.info("不会自动上传到 GitHub 或云端；被上传的文件保存在本机 workspace/uploads/，" 
-            "标注保存在 workspace/overrides/。复制这两个文件夹可备份你的工作。")
+这里是回答正文，也可以包含多段文字、列表、图片 Markdown 链接或 Base64 内置图片。""",
+        language="markdown",
+    )
+    st.info(
+        "不会自动上传到 GitHub 或云端；默认路径配置保存在 workspace/settings.json，"
+        "上传副本保存在 workspace/uploads/，人工标注保存在 workspace/overrides/。"
+    )
 
 
 def main():
     st.title("ZHVision · 知乎回答研究台")
     st.caption("内容清洗 · 分类浏览 · 关键词与词云 · 专题思想证据库 · 手工修订")
+
+    settings = load_user_settings()
+
     with st.sidebar:
-        st.header("📁 数据管理与上传")
-        uploaded = st.file_uploader("上传知乎导出的 MD/JSON，可一次选择多个文件",
-                                    type=["md", "json"], accept_multiple_files=True,
-                                    help="支持原始脚本导出的 answers.md、类似字段顺序的 Markdown、answers_cache.json")
+        st.header("📁 数据管理与路径设置")
+
+        # ---------- 功能 1：设置每次打开解析 .md 文件的默认路径 ----------
+        with st.expander("⚙️ 设置默认 .md 解析路径", expanded=False):
+            default_dir_input = st.text_input(
+                "默认解析文件夹路径",
+                value=settings.get("default_md_dir", str(ROOT)),
+                help="设置存放知乎导出 .md 文件（或包含多个 zhihu_url_token(用户ID) 子文件夹）的根目录，下次启动会自动记住该路径。",
+            )
+            btn_col1, btn_col2 = st.columns(2)
+            if btn_col1.button("📂 浏览选目录", use_container_width=True):
+                picked_dir = pick_folder_via_system_dialog(default_dir_input)
+                if picked_dir:
+                    settings["default_md_dir"] = picked_dir
+                    save_user_settings(settings)
+                    st.cache_data.clear()
+                    st.rerun()
+            if btn_col2.button("💾 保存默认路径", use_container_width=True):
+                cleaned_dir = default_dir_input.strip().strip('"').strip("'")
+                if cleaned_dir and Path(cleaned_dir).exists():
+                    target_dir = str(
+                        Path(cleaned_dir).resolve()
+                        if Path(cleaned_dir).is_dir()
+                        else Path(cleaned_dir).resolve().parent
+                    )
+                    settings["default_md_dir"] = target_dir
+                    save_user_settings(settings)
+                    st.cache_data.clear()
+                    st.success("已保存默认路径！")
+                    st.rerun()
+                else:
+                    st.error("该路径不存在，请检查后重试。")
+
+        if st.button("📄 从默认路径打开 .md 文件", type="primary", use_container_width=True):
+            picked_file = pick_md_file_via_system_dialog(settings.get("default_md_dir", str(ROOT)))
+            if picked_file:
+                pinned = [x for x in settings.get("pinned_files", []) if x != picked_file]
+                pinned.append(picked_file)
+                settings["pinned_files"] = pinned[-30:]
+                settings["last_selected_file"] = picked_file
+                st.session_state["active_source_str"] = picked_file
+                save_user_settings(settings)
+                st.cache_data.clear()
+                st.rerun()
+
+        uploaded = st.file_uploader(
+            "或拖拽上传 MD/JSON 文件（可选）",
+            type=["md", "json"],
+            accept_multiple_files=True,
+            help="支持直接从上方的默认路径读取，也支持拖拽上传 answers.md 或 answers_cache.json",
+        )
         just_uploaded = import_uploads(uploaded)
-        sources = available_sources()
+
+        # 如果刚刚上传了新文件，自动将当前激活文件切换为刚上传的最新文件
+        if just_uploaded:
+            newest_up = str(just_uploaded[-1])
+            if st.session_state.get("_last_uploaded_file") != newest_up:
+                st.session_state["_last_uploaded_file"] = newest_up
+                st.session_state["active_source_str"] = newest_up
+                settings["last_selected_file"] = newest_up
+                save_user_settings(settings)
+
+        sources = scan_md_sources(
+            settings.get("default_md_dir", str(ROOT)),
+            settings.get("pinned_files", []),
+            just_uploaded=just_uploaded,
+        )
         if not sources:
-            st.warning("请先上传 Markdown 文件。"); st.stop()
-        labels = {str(p): p.name.split("__", 1)[-1] if "__" in p.name else p.name for p in sources}
-        # 新文件上传时优先选择新文件，但用户之后可以自由切换历史上传文件。
-        default_idx = sources.index(just_uploaded[-1]) if just_uploaded and just_uploaded[-1] in sources else 0
-        src = st.selectbox("当前分析的文件", sources, index=default_idx,
-                           format_func=lambda p: labels[str(p)])
-        data_hash = sha256(src.read_bytes()).hexdigest()
-        override_path = OVERRIDE_DIR / f"{data_hash[:24]}.json"
+            st.warning("当前默认路径下未找到 .md 或 .json 文件，请点击上方「📄 从默认路径打开 .md 文件」或设置正确的默认目录。")
+            st.stop()
+
+        source_strs = [str(p) for p in sources]
+        label_map = {str(p): format_source_label(p, settings.get("default_md_dir", "")) for p in sources}
+
+        # 维护稳定的选中文件状态，避免切换「全局概览/回答资料库」模块时回退到旧的同名 answers.md
+        preferred_src = st.session_state.get("active_source_str") or settings.get("last_selected_file", "")
+        if preferred_src in source_strs:
+            default_idx = source_strs.index(preferred_src)
+        else:
+            default_idx = 0
+            st.session_state["active_source_str"] = source_strs[0]
+
+        selected_src_str = st.selectbox(
+            "当前分析的文件",
+            source_strs,
+            index=default_idx,
+            format_func=lambda s: label_map.get(s, Path(s).name),
+        )
+
+        if selected_src_str != st.session_state.get("active_source_str") or selected_src_str != settings.get("last_selected_file"):
+            st.session_state["active_source_str"] = selected_src_str
+            settings["last_selected_file"] = selected_src_str
+            save_user_settings(settings)
+
+        src = Path(selected_src_str)
+        stat_info = src.stat()
+        data_hash = cached_file_digest(str(src), stat_info.st_mtime_ns, stat_info.st_size)
+        override_path = resolve_override_path(src, data_hash)
+
         try:
-            base_rows, meta = cached_load(str(src), src.stat().st_mtime_ns)
+            base_rows, meta = cached_load(
+                str(src),
+                stat_info.st_mtime_ns,
+                stat_info.st_size,
+                data_hash[:16],
+            )
         except Exception as exc:
             st.error(f"文件格式不能识别：{exc}")
             st.caption("需要 ## 问题标题及标题下的原文链接或发布时间；可检查上传页面中的格式示例。")
             st.stop()
+
         original = apply_overrides(base_rows, load_overrides(override_path))
-        st.caption(f"当前文件：{src.name} · {len(original):,} 条")
+        original.sort(key=lambda r: r.get("date") or "", reverse=True)
+
+        st.caption(f"已加载：{label_map.get(selected_src_str, src.name)} · 共 **{len(original):,}** 条回答")
         st.divider()
-        page = st.radio("模块", ["📁 上传与管理", "📊 全局概览", "📖 回答资料库", "🧠 专题观点",
-                                 "☁️ 词频词云", "🔗 关联分析", "✍️ 标注与导出"], label_visibility="collapsed")
+        page = st.radio(
+            "模块",
+            [
+                "📁 上传与管理",
+                "📊 全局概览",
+                "📖 回答资料库",
+                "🧠 专题观点",
+                "☁️ 词频词云",
+                "🔗 关联分析",
+                "✍️ 标注与导出",
+            ],
+            label_visibility="collapsed",
+        )
         st.divider()
         st.markdown("**全局筛选**")
-        cats = st.multiselect("所属类别（支持多标签）", ALL_CATEGORIES, default=[], key=f"cats_{data_hash[:10]}")
+        cats = st.multiselect(
+            "所属类别（支持多标签）",
+            ALL_CATEGORIES,
+            default=[],
+            key=f"cats_{data_hash[:10]}",
+        )
+
+        # ---------- 功能 2：发布时间范围筛选支持「全部时间」及快捷区间 ----------
         frame = records_dataframe(original)
-        valid_date = frame["datetime"].dropna()
-        default_start = valid_date.min().date() if not valid_date.empty else date(2000,1,1)
-        default_end = valid_date.max().date() if not valid_date.empty else date.today()
-        picked_dates = st.date_input("发布时间范围", value=(default_start, default_end),
-                                     min_value=default_start, max_value=max(default_end,date.today()),
-                                     key=f"dates_{data_hash[:10]}")
-        start = picked_dates[0] if picked_dates else default_start
-        end = picked_dates[1] if len(picked_dates) > 1 else default_end
-        if st.button("重新解析 / 清理缓存"):
+        valid_date = frame["datetime"].dropna() if "datetime" in frame else pd.Series(dtype="datetime64[ns]")
+        min_date = valid_date.min().date() if not valid_date.empty else date(2000, 1, 1)
+        max_date = valid_date.max().date() if not valid_date.empty else date.today()
+
+        time_mode = st.selectbox(
+            "发布时间范围",
+            ["全部时间", "最近 30 天", "最近半年", "最近 1 年", "按年份筛选", "自定义日期范围"],
+            index=0,
+            key=f"time_mode_{data_hash[:10]}",
+        )
+
+        start = None
+        end = None
+        if time_mode == "全部时间":
+            start, end = None, None
+            if not valid_date.empty:
+                st.caption(f"时间跨度：{min_date} 至 {max_date}（含全部 {len(original):,} 条回答）")
+        elif time_mode == "最近 30 天":
+            end = max_date
+            start = max(min_date, end - timedelta(days=30))
+            st.caption(f"筛选区间：{start} 至 {end}")
+        elif time_mode == "最近半年":
+            end = max_date
+            start = max(min_date, end - timedelta(days=183))
+            st.caption(f"筛选区间：{start} 至 {end}")
+        elif time_mode == "最近 1 年":
+            end = max_date
+            start = max(min_date, end - timedelta(days=365))
+            st.caption(f"筛选区间：{start} 至 {end}")
+        elif time_mode == "按年份筛选":
+            years = sorted({d.year for d in valid_date}, reverse=True) if not valid_date.empty else [date.today().year]
+            picked_year = st.selectbox("选择年份", years, key=f"year_{data_hash[:10]}")
+            start = date(picked_year, 1, 1)
+            end = date(picked_year, 12, 31)
+        else:
+            picked_dates = st.date_input(
+                "选择起止日期",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max(max_date, date.today()),
+                key=f"dates_{data_hash[:10]}",
+            )
+            if isinstance(picked_dates, (list, tuple)):
+                start = picked_dates[0] if len(picked_dates) >= 1 else min_date
+                end = picked_dates[1] if len(picked_dates) >= 2 else start
+            elif isinstance(picked_dates, date):
+                start = end = picked_dates
+            else:
+                start, end = min_date, max_date
+
+        if st.button("🔄 重新解析当前文件 / 清理缓存", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-    filtered = filter_records(original, cats=cats, start=start, end=end)
-    st.caption(f"当前范围：**{len(filtered):,}** / {len(original):,} 条回答")
+
+    # 当选择「全部时间」且未选特定类别时，直接使用完整 original 列表，避免任何无时间戳回答被日期过滤器误筛除
+    if not cats and start is None and end is None:
+        filtered = list(original)
+    else:
+        filtered = filter_records(original, cats=cats, start=start, end=end)
+
+    st.caption(f"当前筛选结果：**{len(filtered):,}** / {len(original):,} 条回答（数据源：`{src}`）")
+
     if page.startswith("📁"):
-        show_data_management(src, original, meta, data_hash)
+        show_data_management(src, original, meta, data_hash, settings)
     elif page.startswith("📊"):
         show_overview(filtered, meta)
     elif page.startswith("📖"):
-        show_library(filtered)
+        show_library(filtered, src_dir=src.parent)
     elif page.startswith("🧠"):
-        show_topic(filtered, original)
+        show_topic(filtered, original, src_dir=src.parent)
     elif page.startswith("☁️"):
         show_words(filtered)
     elif page.startswith("🔗"):
