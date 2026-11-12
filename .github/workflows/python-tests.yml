@@ -18,7 +18,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
       - name: Compile Python files
-        run: python -m compileall -q app.py core.py taxonomy.py tests
+        run: python -m compileall -q app.py core.py taxonomy.py tests Scraper-Content
       - name: Verify imports
         run: python -c "import app, core, taxonomy"
       - name: Run tests

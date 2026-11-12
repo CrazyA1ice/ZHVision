@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+from zhihu_works import WORK_TYPES, normalize_types, sync_user_works
+
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -1148,8 +1150,10 @@ async def run_batch_task(
     wait_for_login_cb,
     progress_cb=None,
     stop_event: threading.Event = None,
+    content_types: tuple = ("answers",),
 ) -> list:
-    """启动 Playwright 浏览器，等待用户确认登录，然后依次处理指定的 1 个或多个知乎用户。"""
+    """启动 Playwright 浏览器，复用会话抓取所选作品类型。"""
+    content_types = normalize_types(content_types)
     results = []
     img_sem = asyncio.Semaphore(CONCURRENCY_IMG)
 
@@ -1179,28 +1183,44 @@ async def run_batch_task(
                 break
             log_fn("=" * 55)
             log_fn(f"开始处理第 {idx}/{len(user_tokens)} 位用户: {token}")
-            try:
-                res = await process_single_user(
-                    page=page,
-                    img_sem=img_sem,
-                    base_dir=base_dir,
-                    url_token=token,
-                    mode=mode,
-                    embed_base64=embed_base64,
-                    fetch_comments=fetch_comments,
-                    log_fn=log_fn,
-                    progress_cb=progress_cb,
-                    stop_event=stop_event,
-                )
-                results.append(res)
-            except Exception as e:
-                log_fn(f"❌ 处理用户 [{token}] 出错: {e}")
-                results.append({
-                    "token": token,
-                    "name": token,
-                    "action": "error",
-                    "error": str(e),
-                })
+            user_meta = None
+            for kind in content_types:
+                if stop_event and stop_event.is_set():
+                    break
+                try:
+                    if kind == "answers":
+                        result = await process_single_user(
+                            page=page, img_sem=img_sem, base_dir=base_dir,
+                            url_token=token, mode=mode, embed_base64=embed_base64,
+                            fetch_comments=fetch_comments, log_fn=log_fn,
+                            progress_cb=progress_cb, stop_event=stop_event,
+                        )
+                    else:
+                        if user_meta is None:
+                            user_meta = await fetch_json(
+                                page, f"https://www.zhihu.com/api/v4/members/{token}"
+                            )
+                        name = user_meta.get("name") or token
+                        uid = str(user_meta.get("id") or "")
+                        user_dir, _, _, _ = ensure_user_dir_with_id(
+                            base_dir, token, name, log_fn=log_fn
+                        )
+                        result = await sync_user_works(
+                            page=page, img_sem=img_sem, base_dir=user_dir,
+                            token=token, kind=kind, mode=mode,
+                            embed_base64=embed_base64, fetch_comments=fetch_comments,
+                            fetch_json=fetch_json,
+                            convert_html=convert_answer_html_to_markdown,
+                            log_fn=log_fn, stop_event=stop_event,
+                            progress_cb=progress_cb, user_name=name, user_id=uid,
+                        )
+                    results.append(result)
+                except Exception as exc:
+                    log_fn(f"❌ 用户 [{token}] 的 {kind} 归档失败: {exc}")
+                    results.append({
+                        "token": token, "name": token, "type": kind,
+                        "action": "error", "error": str(exc),
+                    })
 
         await context.close()
     return results
@@ -1213,8 +1233,8 @@ class ZhihuScraperApp:
     def __init__(self, root):
         self.root = root
         self.root.title("知乎用户回答批量下载与一键更新工具 v3.4")
-        self.root.geometry("980x740")
-        self.root.minsize(860, 650)
+        self.root.geometry("1080x790")
+        self.root.minsize(920, 690)
 
         self.log_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -1227,6 +1247,7 @@ class ZhihuScraperApp:
         self.single_url_var = tk.StringVar(value=f"https://www.zhihu.com/people/{DEFAULT_URL_TOKEN}")
         self.embed_base64_var = tk.BooleanVar(value=True)
         self.fetch_comments_var = tk.BooleanVar(value=True)
+        self.content_type_vars = {kind: tk.BooleanVar(value=(kind == "answers")) for kind in ("answers", *WORK_TYPES)}
         self.status_var = tk.StringVar(value="就绪")
 
         ensure_default_update_list(DEFAULT_UPDATE_LIST_FILE)
@@ -1265,6 +1286,16 @@ class ZhihuScraperApp:
             variable=self.fetch_comments_var,
         ).pack(side=tk.LEFT)
 
+        types_frame = ttk.LabelFrame(main_frame, text="🗂 归档内容（多选）", padding=8)
+        types_frame.pack(fill=tk.X, pady=(0, 8))
+        for kind, label in (
+            ("answers", "回答"), ("pins", "想法"), ("articles", "文章"),
+            ("questions", "提问"), ("zvideos", "视频元数据"),
+        ):
+            ttk.Checkbutton(
+                types_frame, text=label, variable=self.content_type_vars[kind]
+            ).pack(side=tk.LEFT, padx=(2, 20))
+
         # ---------- 2. 指定单用户链接下载区 ----------
         single_frame = ttk.LabelFrame(
             main_frame,
@@ -1280,12 +1311,12 @@ class ZhihuScraperApp:
         url_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
 
         self.btn_single_full = ttk.Button(
-            s_row, text="📥 下载全部回答", command=self._on_download_single_full
+            s_row, text="📥 全量归档所选", command=self._on_download_single_full
         )
         self.btn_single_full.pack(side=tk.LEFT, padx=3)
 
         self.btn_single_inc = ttk.Button(
-            s_row, text="🔄 增量更新该用户", command=self._on_download_single_incremental
+            s_row, text="🔄 增量更新所选", command=self._on_download_single_incremental
         )
         self.btn_single_inc.pack(side=tk.LEFT, padx=3)
 
@@ -1318,14 +1349,14 @@ class ZhihuScraperApp:
         self.tree.heading("user_name", text="用户ID (昵称)")
         self.tree.heading("folder", text="存放文件夹名称")
         self.tree.heading("status", text="本地状态")
-        self.tree.heading("count", text="已存回答数")
+        self.tree.heading("count", text="答/想/文/问/视")
         self.tree.heading("last_time", text="最新回答时间")
 
         self.tree.column("token", width=110, anchor=tk.W)
         self.tree.column("user_name", width=140, anchor=tk.W)
         self.tree.column("folder", width=230, anchor=tk.W)
         self.tree.column("status", width=145, anchor=tk.CENTER)
-        self.tree.column("count", width=85, anchor=tk.CENTER)
+        self.tree.column("count", width=130, anchor=tk.CENTER)
         self.tree.column("last_time", width=140, anchor=tk.CENTER)
 
         tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -1350,7 +1381,7 @@ class ZhihuScraperApp:
 
         self.btn_batch_update = ttk.Button(
             action_bar,
-            text="🚀 一键更新列表全部用户",
+            text="🚀 一键更新所选内容",
             command=self._on_batch_update_clicked,
         )
         self.btn_batch_update.pack(side=tk.RIGHT, padx=6)
@@ -1477,7 +1508,9 @@ class ZhihuScraperApp:
             token = item["token"]
             label = item.get("label", "")
             st = get_user_local_status(base_dir, token, fallback_label=label)
-            status_text = "✅ 已下载（倒序前置续写）" if st["downloaded"] else "🆕 未下载（将从头下载）"
+            archive_dir, _, _, _ = get_user_paths(base_dir, token)
+            has_other_works = any((archive_dir / f"{kind}_cache.json").exists() for kind in WORK_TYPES)
+            status_text = "✅ 已归档（支持增量更新）" if st["downloaded"] or has_other_works else "🆕 尚无归档"
             self.tree.insert(
                 "",
                 tk.END,
@@ -1487,10 +1520,29 @@ class ZhihuScraperApp:
                     st["user_name"],
                     st["folder_name"],
                     status_text,
-                    st["count"],
+                    self._content_counts_display(base_dir, token, st["count"]),
                     st["last_answer_time"] or "-",
                 ),
             )
+
+    def _selected_content_types(self):
+        kinds = [k for k, v in self.content_type_vars.items() if v.get()]
+        if not kinds:
+            messagebox.showwarning("未选择内容", "请至少勾选一种归档内容。")
+            return ()
+        return normalize_types(kinds)
+
+    def _content_counts_display(self, base_dir, token, answer_count):
+        directory, _, _, _ = get_user_paths(base_dir, token)
+        result = [str(answer_count)]
+        for kind in WORK_TYPES:
+            try:
+                file = directory / f"{kind}_cache.json"
+                payload = json.loads(file.read_text(encoding="utf-8")) if file.exists() else {}
+                result.append(str(len(payload)) if isinstance(payload, dict) else "?")
+            except Exception:
+                result.append("?")
+        return "/".join(result)
 
     def _on_add_single_to_list(self):
         raw = self.single_url_var.get().strip()
@@ -1591,6 +1643,9 @@ class ZhihuScraperApp:
         self._start_worker([token], mode="incremental")
 
     def _on_batch_update_clicked(self):
+        selected_types = self._selected_content_types()
+        if not selected_types:
+            return
         self._refresh_update_list_table()
         list_file = Path(self.update_list_path.get())
         base_dir = Path(self.output_base_dir.get())
@@ -1605,20 +1660,26 @@ class ZhihuScraperApp:
         for e in entries:
             st = get_user_local_status(base_dir, e["token"], fallback_label=e.get("label", ""))
             disp = f"{e['token']}({st['user_name']})" if st["user_name"] != "-" else e["token"]
-            if st["downloaded"]:
-                inc_users.append(f"• {disp}（已有 {st['count']} 条，倒序前置写入新增回答）")
+            directory, _, _, _ = get_user_paths(base_dir, e["token"])
+            already = any(
+                (st["downloaded"] if kind == "answers" else (directory / f"{kind}_cache.json").exists())
+                for kind in selected_types
+            )
+            counts = self._content_counts_display(base_dir, e["token"], st["count"])
+            if already:
+                inc_users.append(f"• {disp}（已有归档：答/想/文/问/视 = {counts}）")
             else:
-                new_users.append(f"• {disp}（首次下载，将从头下载全部回答）")
+                new_users.append(f"• {disp}（所选内容首次下载）")
 
         summary_lines = [f"即将更新列表中的 {len(entries)} 位知乎用户：\n"]
         if new_users:
-            summary_lines.append("【首次下载（从头全量下载）】")
+            summary_lines.append("【所选内容首次下载】")
             summary_lines.extend(new_users[:8])
             if len(new_users) > 8:
                 summary_lines.append(f"  ... 等共 {len(new_users)} 位用户")
             summary_lines.append("")
         if inc_users:
-            summary_lines.append("【增量更新（将新增回答倒序写到已有回答之前）】")
+            summary_lines.append("【所选内容增量同步】")
             summary_lines.extend(inc_users[:8])
             if len(inc_users) > 8:
                 summary_lines.append(f"  ... 等共 {len(inc_users)} 位用户")
@@ -1649,6 +1710,10 @@ class ZhihuScraperApp:
         self.progress_bar["value"] = 0
         self._set_running_state(True)
 
+        content_types = self._selected_content_types()
+        if not content_types:
+            self._set_running_state(False)
+            return
         base_dir = Path(self.output_base_dir.get())
         embed_base64 = bool(self.embed_base64_var.get())
         fetch_comments = bool(self.fetch_comments_var.get())
@@ -1666,6 +1731,7 @@ class ZhihuScraperApp:
                         wait_for_login_cb=self._wait_for_login_gui,
                         progress_cb=self._update_progress,
                         stop_event=self.stop_event,
+                        content_types=content_types,
                     )
                 )
                 self.root.after(0, lambda: self._on_worker_finished(results))
@@ -1704,6 +1770,12 @@ class ZhihuScraperApp:
                 )
             elif act == "incremental_none":
                 summary.append(f"• {disp}: 无新增回答（保持 {r.get('total_count', 0)} 条）")
+            elif act == "works_synced":
+                label = WORK_TYPES.get(r.get("type"), ("未知",))[0]
+                summary.append(
+                    f"• {disp} [{label}]: 新增 {r.get('new_count', 0)}、更新 {r.get('changed_count', 0)}、"
+                    f"失败 {r.get('failed_count', 0)}、累计 {r.get('total_count', 0)} 条"
+                )
             else:
                 summary.append(f"• {disp}: 失败 ({r.get('error', '未知错误')})")
 
@@ -1730,6 +1802,7 @@ async def cli_main(args):
         default="",
         help="根据指定的一键更新列表文件（如 update_list.txt）执行批量增量更新",
     )
+    parser.add_argument("--types", default="answers", help="逗号分隔：answers,pins,articles,questions,zvideos")
     parser.add_argument(
         "--full",
         action="store_true",
@@ -1787,11 +1860,12 @@ async def cli_main(args):
         fetch_comments=True,
         log_fn=cli_log,
         wait_for_login_cb=cli_wait_login,
+        content_types=normalize_types(parsed.types),
     )
 
 
 def main():
-    if len(sys.argv) > 1 and any(a in sys.argv for a in ("--cli", "--url", "--update-list", "-h", "--help")):
+    if len(sys.argv) > 1 and any(a in sys.argv for a in ("--cli", "--url", "--update-list", "--types", "-h", "--help")):
         asyncio.run(cli_main(sys.argv[1:]))
     elif tk is not None:
         root = tk.Tk()
