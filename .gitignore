@@ -7,3 +7,20 @@ __pycache__/
 .streamlit/secrets.toml
 workspace/
 *.log
+
+# Zhihu scraper: browser login profile contains cookies; NEVER publish it.
+Scraper-Content/.pw_profile/
+Scraper-Content/.venv/
+zhihu_*/
+Scraper-Content/**/answers_cache.json
+Scraper-Content/**/pins_cache.json
+Scraper-Content/**/articles_cache.json
+Scraper-Content/**/questions_cache.json
+Scraper-Content/**/zvideos_cache.json
+Scraper-Content/**/answers.md
+Scraper-Content/**/pins.md
+Scraper-Content/**/articles.md
+Scraper-Content/**/questions.md
+Scraper-Content/**/zvideos.md
+Scraper-Content/**/*_state.json
+Scraper-Content/**/images/
