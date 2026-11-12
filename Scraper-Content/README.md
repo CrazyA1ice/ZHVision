@@ -1,4 +1,4 @@
-# 知乎用户作品归档 Scraper v4（开发分支）
+# 知乎用户作品归档 Scraper v4
 
 在原有回答归档基础上增加知乎用户「想法、文章、提问、视频」四种内容类型。旧有回答文件 answers.md 和 answers_cache.json 的命名与默认行为不变。
 
@@ -16,7 +16,11 @@
 
 ## 使用方法
 
-Windows 可双击 run_zhihu_scraper.bat；图形界面新增五种内容多选。**默认仅勾选回答**，以保持原有行为。所有操作仍需确认浏览器登录。
+Windows 可双击 run_zhihu_scraper.bat；启动脚本会检查当前 `.venv` 环境是否具备 Playwright 所需的 Chromium 浏览器，缺失或版本升级后会自动安装。图形界面新增五种内容多选。**默认仅勾选回答**，以保持原有行为。所有操作仍需确认浏览器登录。
+
+如果自动安装因网络失败，可在 `Scraper-Content` 文件夹的 PowerShell 中手动执行以下单行命令，然后再次双击启动器：
+
+    .\.venv\Scripts\python.exe -m playwright install chromium
 
 命令行单行示例（从仓库根目录运行）：
 
