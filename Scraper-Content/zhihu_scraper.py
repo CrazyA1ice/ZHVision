@@ -1233,8 +1233,8 @@ class ZhihuScraperApp:
     def __init__(self, root):
         self.root = root
         self.root.title("知乎用户回答批量下载与一键更新工具 v3.4")
-        self.root.geometry("980x740")
-        self.root.minsize(860, 650)
+        self.root.geometry("1080x790")
+        self.root.minsize(920, 690)
 
         self.log_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -1508,7 +1508,9 @@ class ZhihuScraperApp:
             token = item["token"]
             label = item.get("label", "")
             st = get_user_local_status(base_dir, token, fallback_label=label)
-            status_text = "✅ 已下载（倒序前置续写）" if st["downloaded"] else "🆕 未下载（将从头下载）"
+            archive_dir, _, _, _ = get_user_paths(base_dir, token)
+            has_other_works = any((archive_dir / f"{kind}_cache.json").exists() for kind in WORK_TYPES)
+            status_text = "✅ 已归档（支持增量更新）" if st["downloaded"] or has_other_works else "🆕 尚无归档"
             self.tree.insert(
                 "",
                 tk.END,
@@ -1641,6 +1643,9 @@ class ZhihuScraperApp:
         self._start_worker([token], mode="incremental")
 
     def _on_batch_update_clicked(self):
+        selected_types = self._selected_content_types()
+        if not selected_types:
+            return
         self._refresh_update_list_table()
         list_file = Path(self.update_list_path.get())
         base_dir = Path(self.output_base_dir.get())
@@ -1655,20 +1660,26 @@ class ZhihuScraperApp:
         for e in entries:
             st = get_user_local_status(base_dir, e["token"], fallback_label=e.get("label", ""))
             disp = f"{e['token']}({st['user_name']})" if st["user_name"] != "-" else e["token"]
-            if st["downloaded"]:
-                inc_users.append(f"• {disp}（已有 {st['count']} 条，倒序前置写入新增回答）")
+            directory, _, _, _ = get_user_paths(base_dir, e["token"])
+            already = any(
+                (st["downloaded"] if kind == "answers" else (directory / f"{kind}_cache.json").exists())
+                for kind in selected_types
+            )
+            counts = self._content_counts_display(base_dir, e["token"], st["count"])
+            if already:
+                inc_users.append(f"• {disp}（已有归档：答/想/文/问/视 = {counts}）")
             else:
-                new_users.append(f"• {disp}（首次下载，将从头下载全部回答）")
+                new_users.append(f"• {disp}（所选内容首次下载）")
 
         summary_lines = [f"即将更新列表中的 {len(entries)} 位知乎用户：\n"]
         if new_users:
-            summary_lines.append("【首次下载（从头全量下载）】")
+            summary_lines.append("【所选内容首次下载】")
             summary_lines.extend(new_users[:8])
             if len(new_users) > 8:
                 summary_lines.append(f"  ... 等共 {len(new_users)} 位用户")
             summary_lines.append("")
         if inc_users:
-            summary_lines.append("【增量更新（将新增回答倒序写到已有回答之前）】")
+            summary_lines.append("【所选内容增量同步】")
             summary_lines.extend(inc_users[:8])
             if len(inc_users) > 8:
                 summary_lines.append(f"  ... 等共 {len(inc_users)} 位用户")
@@ -1854,7 +1865,7 @@ async def cli_main(args):
 
 
 def main():
-    if len(sys.argv) > 1 and any(a in sys.argv for a in ("--cli", "--url", "--update-list", "-h", "--help")):
+    if len(sys.argv) > 1 and any(a in sys.argv for a in ("--cli", "--url", "--update-list", "--types", "-h", "--help")):
         asyncio.run(cli_main(sys.argv[1:]))
     elif tk is not None:
         root = tk.Tk()
